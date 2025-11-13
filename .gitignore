@@ -1,0 +1,162 @@
+# Environment and Configuration Files
+.env
+.env.local
+.env.production
+.env.staging
+*.env
+
+# Sensitive Credentials and Keys
+config.json
+credentials.json
+secrets.json
+api_keys.txt
+passwords.txt
+
+# Log Files (Contains sensitive user data)
+*.log
+logs/
+requests.log
+validation_errors.log
+server.log
+schmick_service.log
+error.log
+debug.log
+
+# Playwright Browser State and Storage
+state.json
+storage_state.json
+browser_state.json
+cookies.json
+session.json
+
+# Downloaded/Extracted Data Files
+extracted_id.txt
+member_ids.txt
+results.txt
+output.txt
+
+# Python Cache and Virtual Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Playwright Cache and Browsers
+.playwright/
+playwright-browsers/
+browser-cache/
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary Files
+*.tmp
+*.temp
+temp/
+tmp/
+.cache/
+
+# Database Files (if you add SQLite logging)
+*.db
+*.sqlite
+*.sqlite3
+
+# Screenshots and Videos (Playwright debugging)
+screenshots/
+videos/
+test-results/
+playwright-report/
+
+# Node.js (if you add any frontend)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Docker (but keep Dockerfile)
+.dockerignore
+
+# Railway Local Files
+.railway/
+
+# Backup Files
+*.backup
+*.bak
+*.orig
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Python Distribution / Packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit Test / Coverage Reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json

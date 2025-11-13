@@ -6,6 +6,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import os
+import re
 import logging
 from datetime import datetime
 from typing import Optional
@@ -81,12 +82,15 @@ logger = logging.getLogger("PlaywrightAutomation")
 # FastAPI app
 app = FastAPI(title="Simple Login Automation", version="1.0.0")
 
+# Diagnostics artifacts directory
+os.makedirs(os.path.join("logs", "artifacts"), exist_ok=True)
+
 # Pydantic model for login request
 class LoginRequest(BaseModel):
     username: str
     password: str
+    s3_filename: str  # Filename to fetch from S3
     url: Optional[str] = "https://lendly.catch-e.net.au/core/login.phpo?i=&user_login=ben.lazzaro&screen_width=1536&screen_height=960"
-    s3_filename: Optional[str] = None  # Filename to fetch from S3
 
 # Global browser instance
 browser_instance = None
@@ -94,6 +98,76 @@ browser_instance = None
 # S3 Configuration
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "fuel-invoices-receipt")
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-2")
+
+def _get_s3_client():
+    return boto3.client(
+        's3',
+        region_name=AWS_REGION,
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
+    )
+
+def resolve_s3_key(user_filename: str) -> Optional[str]:
+    """
+    Try to resolve a user-provided filename to an S3 object key in the bucket.
+
+    Matching strategy (first hit wins):
+    1) Exact key match
+    2) Key ending with filename (basename match)
+    3) Case-insensitive basename match
+    4) First key that contains the filename as a substring
+
+    Returns:
+        The resolved key if found, otherwise None
+    """
+    try:
+        s3_client = _get_s3_client()
+
+        # 1) Exact key match (HEAD request is cheap)
+        try:
+            s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=user_filename)
+            return user_filename
+        except ClientError:
+            pass
+
+        paginator = s3_client.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(Bucket=S3_BUCKET_NAME)
+
+        target_lower = user_filename.lower()
+        basename_lower = os.path.basename(user_filename).lower()
+
+        exact_basename_key = None
+        ci_basename_key = None
+        contains_key = None
+
+        for page in page_iterator:
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                key_lower = key.lower()
+
+                # 2) Key ending with filename (basename match)
+                if key.endswith(user_filename):
+                    return key
+
+                # 3) Case-insensitive basename match
+                if os.path.basename(key_lower) == basename_lower and ci_basename_key is None:
+                    ci_basename_key = key
+
+                # 4) Substring match (fallback)
+                if target_lower in key_lower and contains_key is None:
+                    contains_key = key
+
+        if exact_basename_key:
+            return exact_basename_key
+        if ci_basename_key:
+            return ci_basename_key
+        if contains_key:
+            return contains_key
+
+        return None
+    except Exception as e:
+        logger.error(f"[S3] Failed to resolve key for '{user_filename}': {e}")
+        return None
 
 def download_file_from_s3(filename: str, local_path: str) -> bool:
     """
@@ -108,20 +182,14 @@ def download_file_from_s3(filename: str, local_path: str) -> bool:
     """
     try:
         logger.info(f"[S3] Attempting to download file: {filename} from bucket: {S3_BUCKET_NAME}")
-        
-        # Initialize S3 client
-        s3_client = boto3.client(
-            's3',
-            region_name=AWS_REGION,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY")
-        )
-        
+
+        s3_client = _get_s3_client()
+
         # Download file from S3
         s3_client.download_file(S3_BUCKET_NAME, filename, local_path)
         logger.info(f"[S3] File downloaded successfully to: {local_path}")
         return True
-        
+
     except ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == '404':
@@ -131,6 +199,153 @@ def download_file_from_s3(filename: str, local_path: str) -> bool:
         return False
     except Exception as e:
         logger.error(f"[S3] Unexpected error: {str(e)}")
+        return False
+
+def prepare_local_file_from_s3(requested_filename: str) -> Optional[str]:
+    """
+    Resolve a filename to an S3 key and download it to a temp file.
+    Returns the local temp file path if successful, else None.
+    """
+    if not requested_filename:
+        return None
+
+    key = resolve_s3_key(requested_filename)
+    if not key:
+        logger.warning(f"[S3] No matching object found for '{requested_filename}' in bucket '{S3_BUCKET_NAME}'")
+        return None
+
+    temp_dir = tempfile.gettempdir()
+    local_path = os.path.join(temp_dir, os.path.basename(key))
+    if download_file_from_s3(key, local_path):
+        return local_path
+    return None
+
+async def select_calns_in_popup(popup_page, navigation_steps) -> bool:
+    """
+    Robustly select CALNS inside the popup page. Searches across the popup root
+    and all its frames, with multiple selector strategies and waits. Captures
+    artifacts if not found for easier diagnostics.
+
+    Returns True if a click/selection was made, False otherwise.
+    """
+    try:
+        try:
+            await popup_page.bring_to_front()
+        except Exception:
+            pass
+
+        # Give popup time for any XHR-driven content
+        try:
+            await popup_page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        # Wait until CALNS text appears anywhere in popup (root or frames)
+        async def has_calns():
+            try:
+                if await popup_page.locator('text=/\\bCALNS\\b/i').count() > 0:
+                    return True
+                for fr in popup_page.frames:
+                    try:
+                        if await fr.locator('text=/\\bCALNS\\b/i').count() > 0:
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return False
+
+        # Poll for up to 7 seconds
+        end_wait_ms = 7000
+        step = 250
+        waited = 0
+        while waited < end_wait_ms:
+            if await has_calns():
+                break
+            await popup_page.wait_for_timeout(step)
+            waited += step
+
+        # Candidate selectors to try
+        selector_sets = [
+            ['role=link[name=/^\\s*CALNS\\s*$/i]'],
+            ['text=/\\bCALNS\\b/i'],
+            ['a:has-text("CALNS")'],
+            ['td:has-text("CALNS")', 'tr:has-text("CALNS")'],
+            ['xpath=//a[normalize-space(.)="CALNS"]',
+             'xpath=//tr[.//text()[contains(.,"CALNS")]]',
+             'xpath=//td[.//text()[contains(.,"CALNS")]]']
+        ]
+
+        contexts = [popup_page] + popup_page.frames
+        for sel_group in selector_sets:
+            for ctx in contexts:
+                for sel in sel_group:
+                    try:
+                        loc = ctx.locator(sel).first
+                        if await loc.count() == 0:
+                            continue
+                        await loc.scroll_into_view_if_needed()
+                        try:
+                            await loc.click()
+                        except Exception:
+                            # Try dblclick, then force
+                            try:
+                                await loc.dblclick()
+                            except Exception:
+                                await loc.click(force=True)
+                        navigation_steps.append(f"Selected CALNS in popup using selector: {sel}")
+                        return True
+                    except Exception:
+                        continue
+
+        # As a last fallback, try to click nearest clickable ancestor via JS
+        try:
+            clicked = await popup_page.evaluate("""
+                () => {
+                  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+                  const matches = [];
+                  while (walker.nextNode()) {
+                    const el = walker.currentNode;
+                    if (!el || !el.innerText) continue;
+                    if (/\bCALNS\b/i.test(el.innerText)) {
+                      matches.push(el);
+                    }
+                  }
+                  for (const el of matches) {
+                    let node = el;
+                    for (let i=0; i<4 && node; i++) {
+                      if (node.tagName === 'A' || node.onclick || node.getAttribute('href')) {
+                        node.click();
+                        return true;
+                      }
+                      node = node.parentElement;
+                    }
+                  }
+                  return false;
+                }
+            """)
+            if clicked:
+                navigation_steps.append("Selected CALNS in popup via JS fallback")
+                return True
+        except Exception:
+            pass
+
+        # Save artifacts for debugging
+        try:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            html_path = os.path.join('logs', 'artifacts', f'popup_{ts}.html')
+            png_path = os.path.join('logs', 'artifacts', f'popup_{ts}.png')
+            content = await popup_page.content()
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            await popup_page.screenshot(path=png_path, full_page=True)
+            navigation_steps.append(f"Saved popup artifacts: {html_path}, {png_path}")
+        except Exception:
+            pass
+
+        return False
+    except Exception as e:
+        navigation_steps.append(f"Popup CALNS selection error: {e}")
         return False
 
 @app.post("/login")
@@ -257,6 +472,16 @@ async def login(credentials: LoginRequest):
         page_title = await page.title()
         logger.info(f"📄 Current page: {page_title} - {final_url}")
         
+        # If provided, pre-resolve and download S3 file for upload later
+        upload_file_local_path: Optional[str] = None
+        if credentials.s3_filename:
+            logger.info(f"[S3] Resolving provided filename: {credentials.s3_filename}")
+            upload_file_local_path = prepare_local_file_from_s3(credentials.s3_filename)
+            if upload_file_local_path:
+                logger.info(f"[S3] File ready for upload at: {upload_file_local_path}")
+            else:
+                logger.warning("[S3] Could not prepare file for upload; proceeding without upload")
+
         # Navigation after successful login
         logger.info("🧭 Starting navigation sequence...")
         navigation_success = False
@@ -401,16 +626,26 @@ async def login(credentials: LoginRequest):
                                     try:
                                         popup_page = await popup_promise
                                         await popup_page.wait_for_load_state("domcontentloaded")
-                                        navigation_steps.append("Popup window detected and loaded")
+                                        # Use robust selector routine to click CALNS
+                                        calns_clicked = await select_calns_in_popup(popup_page, navigation_steps)
 
-                                        # Wait a bit to ensure the frame loads
-                                        await page.wait_for_timeout(2000)  # small delay for JS onblur trigger
+                                        # If we clicked an option, wait for popup to close
+                                        if calns_clicked:
+                                            try:
+                                                await popup_page.wait_for_close(timeout=10000)
+                                                navigation_steps.append("Popup closed after selecting CALNS")
+                                            except Exception:
+                                                navigation_steps.append("Popup did not close automatically after selection")
+                                        else:
+                                            navigation_steps.append("CALNS option not found/clicked in popup; proceeding anyway")
 
-                                        # Try to detect if page reloaded / frame changed
+                                        # Small delay to allow main page to update based on selection
+                                        await page.wait_for_timeout(1500)
+
+                                        # Try to detect if page has frames and find dropzone
                                         frames = page.frames
                                         navigation_steps.append(f"After popup close, page has {len(frames)} frames")
 
-                                        # Look for frame that contains dropzone
                                         dropzone_frame = None
                                         for frame in frames:
                                             try:
@@ -424,54 +659,45 @@ async def login(credentials: LoginRequest):
                                         if dropzone_frame:
                                             navigation_steps.append(f"Found dropzone inside frame: {dropzone_frame.url}")
 
-                                            # Wait for the <a> inside that frame
+                                            # Wait for the dropzone inside that frame
                                             try:
-                                                await dropzone_frame.wait_for_selector('#file-attachment-dropzone a', timeout=20000)
+                                                await dropzone_frame.wait_for_selector('#file-attachment-dropzone', timeout=20000)
                                                 
-                                                # Download file from S3 if filename is provided
-                                                local_file_path = None
-                                                if credentials.s3_filename:
-                                                    navigation_steps.append(f"S3 filename provided: {credentials.s3_filename}")
-                                                    
-                                                    # Create temporary file path
-                                                    temp_dir = tempfile.gettempdir()
-                                                    local_file_path = os.path.join(temp_dir, credentials.s3_filename)
-                                                    navigation_steps.append(f"Temp file path: {local_file_path}")
-                                                    
-                                                    # Download from S3
-                                                    if download_file_from_s3(credentials.s3_filename, local_file_path):
-                                                        navigation_steps.append("File downloaded from S3 successfully")
-                                                        
-                                                        # Upload the file using Playwright's file chooser
-                                                        try:
-                                                            # Set up file chooser listener
-                                                            async with dropzone_frame.expect_file_chooser() as fc_info:
-                                                                await dropzone_frame.click('#file-attachment-dropzone a')
-                                                            
-                                                            file_chooser = await fc_info.value
-                                                            await file_chooser.set_files(local_file_path)
-                                                            navigation_steps.append(f"File uploaded successfully: {credentials.s3_filename}")
-                                                            
-                                                            # Wait for upload to complete
+                                                # Click browse and attach file if available
+                                                if upload_file_local_path and os.path.exists(upload_file_local_path):
+                                                    try:
+                                                        # Prefer direct file input if present
+                                                        file_input = await dropzone_frame.query_selector('input[type="file"]')
+                                                        if file_input:
+                                                            await dropzone_frame.set_input_files('input[type="file"]', upload_file_local_path)
+                                                            navigation_steps.append(f"File uploaded via set_input_files: {os.path.basename(upload_file_local_path)}")
                                                             await page.wait_for_timeout(2000)
                                                             navigation_steps.append("Waited for file upload to process")
-                                                            
-                                                        except Exception as upload_error:
-                                                            navigation_steps.append(f"File upload error: {str(upload_error)}")
-                                                        finally:
-                                                            # Clean up temporary file
-                                                            try:
-                                                                if os.path.exists(local_file_path):
-                                                                    os.remove(local_file_path)
-                                                                    navigation_steps.append("Temporary file cleaned up")
-                                                            except:
-                                                                pass
-                                                    else:
-                                                        navigation_steps.append("Failed to download file from S3")
+                                                        else:
+                                                            # Fall back to page-level file chooser while clicking inside frame
+                                                            async with page.expect_file_chooser() as fc_info:
+                                                                await dropzone_frame.click('#file-attachment-dropzone a')
+                                                            file_chooser = await fc_info.value
+                                                            await file_chooser.set_files(upload_file_local_path)
+                                                            navigation_steps.append(f"File uploaded via file chooser: {os.path.basename(upload_file_local_path)}")
+                                                            await page.wait_for_timeout(2000)
+                                                            navigation_steps.append("Waited for file upload to process")
+                                                    except Exception as upload_error:
+                                                        navigation_steps.append(f"File upload error: {str(upload_error)}")
+                                                    finally:
+                                                        try:
+                                                            if os.path.exists(upload_file_local_path):
+                                                                os.remove(upload_file_local_path)
+                                                                navigation_steps.append("Temporary file cleaned up")
+                                                        except:
+                                                            pass
                                                 else:
-                                                    # Just click browse without uploading
-                                                    await dropzone_frame.click('#file-attachment-dropzone a')
-                                                    navigation_steps.append("Clicked 'browse' link inside dropzone frame (no file upload)")
+                                                    # No file provided; try opening browse to indicate reachability
+                                                    try:
+                                                        await dropzone_frame.click('#file-attachment-dropzone a')
+                                                        navigation_steps.append("Clicked 'browse' link inside dropzone frame (no file upload)")
+                                                    except Exception:
+                                                        navigation_steps.append("Dropzone link not clickable without file")
                                                     
                                             except Exception as browse_error:
                                                 navigation_steps.append(f"Failed to click 'browse' link inside frame: {browse_error}")
@@ -479,50 +705,36 @@ async def login(credentials: LoginRequest):
                                         else:
                                             # Fallback — maybe dropzone is in main DOM, but just delayed
                                             try:
-                                                await page.wait_for_selector('#file-attachment-dropzone a', timeout=20000)
+                                                await page.wait_for_selector('#file-attachment-dropzone', timeout=20000)
                                                 
-                                                # Download file from S3 if filename is provided
-                                                local_file_path = None
-                                                if credentials.s3_filename:
-                                                    navigation_steps.append(f"S3 filename provided (main page): {credentials.s3_filename}")
-                                                    
-                                                    # Create temporary file path
-                                                    temp_dir = tempfile.gettempdir()
-                                                    local_file_path = os.path.join(temp_dir, credentials.s3_filename)
-                                                    navigation_steps.append(f"Temp file path: {local_file_path}")
-                                                    
-                                                    # Download from S3
-                                                    if download_file_from_s3(credentials.s3_filename, local_file_path):
-                                                        navigation_steps.append("File downloaded from S3 successfully (main page)")
-                                                        
-                                                        # Upload the file using Playwright's file chooser
-                                                        try:
-                                                            # Set up file chooser listener
-                                                            async with page.expect_file_chooser() as fc_info:
-                                                                await page.click('#file-attachment-dropzone a')
-                                                            
-                                                            file_chooser = await fc_info.value
-                                                            await file_chooser.set_files(local_file_path)
-                                                            navigation_steps.append(f"File uploaded successfully: {credentials.s3_filename}")
-                                                            
-                                                            # Wait for upload to complete
+                                                # Click browse and attach file if available (main page)
+                                                if upload_file_local_path and os.path.exists(upload_file_local_path):
+                                                    try:
+                                                        # Prefer direct file input if present
+                                                        file_input = await page.query_selector('input[type="file"]')
+                                                        if file_input:
+                                                            await page.set_input_files('input[type="file"]', upload_file_local_path)
+                                                            navigation_steps.append(f"File uploaded via set_input_files: {os.path.basename(upload_file_local_path)}")
                                                             await page.wait_for_timeout(2000)
                                                             navigation_steps.append("Waited for file upload to process")
-                                                            
-                                                        except Exception as upload_error:
-                                                            navigation_steps.append(f"File upload error: {str(upload_error)}")
-                                                        finally:
-                                                            # Clean up temporary file
-                                                            try:
-                                                                if os.path.exists(local_file_path):
-                                                                    os.remove(local_file_path)
-                                                                    navigation_steps.append("Temporary file cleaned up")
-                                                            except:
-                                                                pass
-                                                    else:
-                                                        navigation_steps.append("Failed to download file from S3")
+                                                        else:
+                                                            async with page.expect_file_chooser() as fc_info:
+                                                                await page.click('#file-attachment-dropzone a')
+                                                            file_chooser = await fc_info.value
+                                                            await file_chooser.set_files(upload_file_local_path)
+                                                            navigation_steps.append(f"File uploaded via file chooser: {os.path.basename(upload_file_local_path)}")
+                                                            await page.wait_for_timeout(2000)
+                                                            navigation_steps.append("Waited for file upload to process")
+                                                    except Exception as upload_error:
+                                                        navigation_steps.append(f"File upload error: {str(upload_error)}")
+                                                    finally:
+                                                        try:
+                                                            if os.path.exists(upload_file_local_path):
+                                                                os.remove(upload_file_local_path)
+                                                                navigation_steps.append("Temporary file cleaned up")
+                                                        except:
+                                                            pass
                                                 else:
-                                                    # Just click browse without uploading
                                                     await page.click('#file-attachment-dropzone a')
                                                     navigation_steps.append("Clicked 'browse' link successfully on main page (no file upload)")
                                                     
@@ -559,8 +771,8 @@ async def login(credentials: LoginRequest):
         
         # Close browser
         logger.info("🔄 Closing browser...")
-        await browser.close()
-        await playwright.stop()
+        # await browser.close()
+        # await playwright.stop()
         logger.info("✅ Automation completed successfully!")
         
         return {
