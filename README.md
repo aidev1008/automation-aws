@@ -173,7 +173,7 @@ The application includes comprehensive error handling for:
 
 ```powershell
 # With auto-reload
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 ### Taking Screenshots

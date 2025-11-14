@@ -90,6 +90,8 @@ class LoginRequest(BaseModel):
     username: str
     password: str
     s3_filename: str  # Filename to fetch from S3
+    gross: str
+    invoice_number: str
     url: Optional[str] = "https://lendly.catch-e.net.au/core/login.phpo?i=&user_login=ben.lazzaro&screen_width=1536&screen_height=960"
 
 # Global browser instance
@@ -364,10 +366,18 @@ async def login(credentials: LoginRequest):
         # Start playwright
         logger.info("🔧 Initializing Playwright browser...")
         playwright = await async_playwright().start()
-        browser = await playwright.chromium.launch(headless=headless)
+        browser = await playwright.firefox.launch(headless=headless)
+        # Configurable viewport to control window size
+        try:
+            vp_width = int(os.getenv("BROWSER_WIDTH", "720"))
+            vp_height = int(os.getenv("BROWSER_HEIGHT", "780"))
+        except Exception:
+            vp_width, vp_height = 720, 780
         context = await browser.new_context(
-            viewport={"width": 1536, "height": 960}
+            viewport={"width": vp_width, "height": vp_height},
+            screen={"width": vp_width, "height": vp_height}
         )
+        logger.info(f"Viewport set to {vp_width}x{vp_height}")
         page = await context.new_page()
         logger.info("✅ Browser initialized successfully")
         
@@ -647,6 +657,7 @@ async def login(credentials: LoginRequest):
                                         navigation_steps.append(f"After popup close, page has {len(frames)} frames")
 
                                         dropzone_frame = None
+                                        file_uploaded = False
                                         for frame in frames:
                                             try:
                                                 content = await frame.content()
@@ -671,6 +682,7 @@ async def login(credentials: LoginRequest):
                                                         if file_input:
                                                             await dropzone_frame.set_input_files('input[type="file"]', upload_file_local_path)
                                                             navigation_steps.append(f"File uploaded via set_input_files: {os.path.basename(upload_file_local_path)}")
+                                                            file_uploaded = True
                                                             await page.wait_for_timeout(2000)
                                                             navigation_steps.append("Waited for file upload to process")
                                                         else:
@@ -680,6 +692,7 @@ async def login(credentials: LoginRequest):
                                                             file_chooser = await fc_info.value
                                                             await file_chooser.set_files(upload_file_local_path)
                                                             navigation_steps.append(f"File uploaded via file chooser: {os.path.basename(upload_file_local_path)}")
+                                                            file_uploaded = True
                                                             await page.wait_for_timeout(2000)
                                                             navigation_steps.append("Waited for file upload to process")
                                                     except Exception as upload_error:
@@ -710,23 +723,18 @@ async def login(credentials: LoginRequest):
                                                 # Click browse and attach file if available (main page)
                                                 if upload_file_local_path and os.path.exists(upload_file_local_path):
                                                     try:
-                                                        # Prefer direct file input if present
                                                         file_input = await page.query_selector('input[type="file"]')
-                                                        if file_input:
-                                                            await page.set_input_files('input[type="file"]', upload_file_local_path)
-                                                            navigation_steps.append(f"File uploaded via set_input_files: {os.path.basename(upload_file_local_path)}")
-                                                            await page.wait_for_timeout(2000)
-                                                            navigation_steps.append("Waited for file upload to process")
+                                                        if not file_input:
+                                                            navigation_steps.append("No file input found on main page")
                                                         else:
-                                                            async with page.expect_file_chooser() as fc_info:
-                                                                await page.click('#file-attachment-dropzone a')
-                                                            file_chooser = await fc_info.value
-                                                            await file_chooser.set_files(upload_file_local_path)
-                                                            navigation_steps.append(f"File uploaded via file chooser: {os.path.basename(upload_file_local_path)}")
+                                                            await page.set_input_files('input[type="file"]', upload_file_local_path)
+                                                            navigation_steps.append(f"File uploaded via set_input_files on main page: {os.path.basename(upload_file_local_path)}")
+                                                            file_uploaded = True
+                                                            # Wait 2 sec for Catch-E to parse file
                                                             await page.wait_for_timeout(2000)
-                                                            navigation_steps.append("Waited for file upload to process")
+
                                                     except Exception as upload_error:
-                                                        navigation_steps.append(f"File upload error: {str(upload_error)}")
+                                                        navigation_steps.append(f"Upload error inside CALNS frame: {upload_error}")
                                                     finally:
                                                         try:
                                                             if os.path.exists(upload_file_local_path):
@@ -741,6 +749,191 @@ async def login(credentials: LoginRequest):
                                             except Exception as browse_error:
                                                 navigation_steps.append(f"Browse link not found after waiting: {browse_error}")
                                         
+                                        # If a file was uploaded, wait 5s then click Upload
+                                        if file_uploaded:
+                                            try:
+                                                await page.wait_for_timeout(5000)
+                                                navigation_steps.append("Waited 5 seconds before clicking Upload")
+
+                                                upload_selectors = [
+                                                    '#button_upload',
+                                                    'input#button_upload',
+                                                    'input[name="button_upload"]',
+                                                    'input.formbutton[value="Upload"]',
+                                                    'input[value="Upload"]'
+                                                ]
+
+                                                clicked = False
+                                                # Try main page first
+                                                for sel in upload_selectors:
+                                                    try:
+                                                        loc = await page.query_selector(sel)
+                                                        if loc:
+                                                            await loc.scroll_into_view_if_needed()
+                                                            await loc.click()
+                                                            navigation_steps.append(f"Clicked Upload button using selector on main page: {sel}")
+                                                            clicked = True
+                                                            break
+                                                    except Exception:
+                                                        continue
+
+                                                # If not found on main page, try within frames
+                                                if not clicked:
+                                                    for fr in page.frames:
+                                                        try:
+                                                            for sel in upload_selectors:
+                                                                try:
+                                                                    loc = await fr.query_selector(sel)
+                                                                    if loc:
+                                                                        await loc.scroll_into_view_if_needed()
+                                                                        await loc.click()
+                                                                        navigation_steps.append(f"Clicked Upload button inside frame using selector: {sel}")
+                                                                        clicked = True
+                                                                        break
+                                                                except Exception:
+                                                                    continue
+                                                            if clicked:
+                                                                break
+                                                        except Exception:
+                                                            continue
+
+                                                if not clicked:
+                                                    navigation_steps.append("Upload button not found after file selection")
+                                                else:
+                                                    # After successful click, wait briefly for any DOM updates
+                                                    await page.wait_for_timeout(2000)
+                                                    navigation_steps.append("Post-upload wait completed")
+
+                                                    # Attempt to fill the invoice number field
+                                                    invoice_selectors = [
+                                                        'input#invoice_no',
+                                                        'input[name="invoice_no"]',
+                                                        'input.forminput#invoice_no'
+                                                    ]
+                                                    invoice_filled = False
+                                                    if credentials.invoice_number:
+                                                        for sel in invoice_selectors:
+                                                            try:
+                                                                # Wait for selector to appear (short timeout per selector)
+                                                                elem = await page.query_selector(sel)
+                                                                if not elem:
+                                                                    continue
+                                                                await elem.fill(credentials.invoice_number)
+                                                                navigation_steps.append(f"Filled invoice number using selector: {sel}")
+                                                                invoice_filled = True
+                                                                break
+                                                            except Exception:
+                                                                continue
+                                                        if not invoice_filled:
+                                                            navigation_steps.append("Invoice number field not found / not filled")
+                                                    else:
+                                                        navigation_steps.append("No invoice_number provided in request; skipping fill")
+
+                                                    # Compare displayed total_gross with provided gross; if equal, click Save
+                                                    def _normalize_amount(s: str) -> Optional[str]:
+                                                        try:
+                                                            if s is None:
+                                                                return None
+                                                            # strip whitespace and non-breaking spaces
+                                                            v = str(s).strip().replace("\xa0", " ")
+                                                            # remove thousands separators and spaces
+                                                            v = v.replace(",", "").replace(" ", "")
+                                                            # keep only digits and decimal point
+                                                            m = re.findall(r"[0-9]+(?:\.[0-9]{1,4})?", v)
+                                                            if not m:
+                                                                return None
+                                                            # format to two decimals where possible
+                                                            num = m[0]
+                                                            if "." in num:
+                                                                parts = num.split(".")
+                                                                decimals = (parts[1] + "00")[:2]
+                                                                return f"{int(parts[0])}.{decimals}"
+                                                            else:
+                                                                return f"{int(num)}.00"
+                                                        except Exception:
+                                                            return None
+
+                                                    # Find total_gross text either on main page or in frames
+                                                    displayed_gross_text = None
+                                                    try:
+                                                        gross_el = await page.query_selector('#total_gross')
+                                                        if gross_el:
+                                                            displayed_gross_text = (await gross_el.inner_text())
+                                                    except Exception:
+                                                        pass
+                                                    if not displayed_gross_text:
+                                                        for fr in page.frames:
+                                                            try:
+                                                                gross_el = await fr.query_selector('#total_gross')
+                                                                if gross_el:
+                                                                    displayed_gross_text = (await gross_el.inner_text())
+                                                                    break
+                                                            except Exception:
+                                                                continue
+
+                                                    provided_gross_norm = _normalize_amount(credentials.gross)
+                                                    displayed_gross_norm = _normalize_amount(displayed_gross_text)
+
+                                                    if displayed_gross_norm and provided_gross_norm:
+                                                        if displayed_gross_norm == provided_gross_norm:
+                                                            navigation_steps.append(f"total_gross matches provided gross ({displayed_gross_norm})")
+
+                                                            # Attempt to click Save button
+                                                            save_selectors = [
+                                                                '#button_save_preview',
+                                                                'input#button_save_preview',
+                                                                'input[name="button_save_preview"]',
+                                                                'input.formbutton#button_save_preview',
+                                                                'input.formbutton[value="Save"]'
+                                                            ]
+                                                            save_clicked = False
+
+                                                            # Try main page first
+                                                            # for sel in save_selectors:
+                                                            #     try:
+                                                            #         loc = await page.query_selector(sel)
+                                                            #         if loc:
+                                                            #             await loc.scroll_into_view_if_needed()
+                                                            #             await loc.click()
+                                                            #             navigation_steps.append(f"Clicked Save button using selector: {sel}")
+                                                            #             save_clicked = True
+                                                            #             break
+                                                            #     except Exception:
+                                                            #         continue
+
+                                                            # # If not on main page, search in frames
+                                                            # if not save_clicked:
+                                                            #     for fr in page.frames:
+                                                            #         try:
+                                                            #             for sel in save_selectors:
+                                                            #                 try:
+                                                            #                     loc = await fr.query_selector(sel)
+                                                            #                     if loc:
+                                                            #                         await loc.scroll_into_view_if_needed()
+                                                            #                         await loc.click()
+                                                            #                         navigation_steps.append(f"Clicked Save button inside frame using selector: {sel}")
+                                                            #                         save_clicked = True
+                                                            #                         break
+                                                            #                 except Exception:
+                                                            #                     continue
+                                                            #             if save_clicked:
+                                                            #                 break
+                                                            #         except Exception:
+                                                            #             continue
+
+                                                            if not save_clicked:
+                                                                navigation_steps.append("Save button not found after gross match")
+                                                            else:
+                                                                # Give time for save action to process
+                                                                await page.wait_for_timeout(3000)
+                                                                navigation_steps.append("Post-save wait completed")
+                                                        else:
+                                                            navigation_steps.append(f"Gross mismatch; displayed={displayed_gross_norm}, provided={provided_gross_norm}")
+                                                    else:
+                                                        navigation_steps.append("Could not normalize displayed/provided gross for comparison")
+                                            except Exception as upload_click_error:
+                                                navigation_steps.append(f"Failed to click Upload button: {upload_click_error}")
+
                                         # Wait 3 seconds after clicking browse link
                                         await page.wait_for_timeout(3000)
                                         navigation_steps.append("Waited 3 seconds after browse link click")
