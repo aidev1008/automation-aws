@@ -10,7 +10,7 @@ import re
 import logging
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
@@ -18,18 +18,33 @@ import uvicorn
 import boto3
 from botocore.exceptions import ClientError
 import tempfile
+from web_selectors import (
+    USERNAME_SELECTORS,
+    PASSWORD_SELECTORS,
+    SUBMIT_SELECTORS,
+    FLEET_SELECTORS,
+    CARD_SERVICES_SELECTORS,
+    TRANSACTION_SELECTORS,
+    IMPORT_BUTTON_SELECTORS,
+    INTERFACE_CODE_INPUT_SELECTORS,
+    SEARCH_BUTTON_SELECTORS,
+    DROPZONE_SELECTOR,
+    FILE_INPUT_SELECTOR,
+    UPLOAD_BUTTON_SELECTORS,
+    INVOICE_INPUT_SELECTORS,
+    TOTAL_GROSS_SELECTOR,
+    SAVE_BUTTON_SELECTORS,
+    CHECK_BUTTON_SELECTORS,
+    POST_BUTTON_SELECTORS,
+)
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # Create logs directory if it doesn't exist
 os.makedirs("logs", exist_ok=True)
-
-# Create custom formatter to handle Unicode issues
 class SafeFormatter(logging.Formatter):
     def format(self, record):
         # Remove emojis and replace with simple text
@@ -94,8 +109,105 @@ class LoginRequest(BaseModel):
     invoice_number: str
     url: Optional[str] = "https://lendly.catch-e.net.au/core/login.phpo?i=&user_login=ben.lazzaro&screen_width=1536&screen_height=960"
 
-# Global browser instance
-browser_instance = None
+# Helper utilities
+async def query_selector_any(page, selectors):
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                return el, sel
+        except Exception:
+            continue
+    return None, None
+
+
+async def query_selector_any_in_page_or_frames(page, selectors):
+    el, sel = await query_selector_any(page, selectors)
+    if el:
+        return el, sel, page
+    for fr in page.frames:
+        try:
+            for s in selectors:
+                try:
+                    el = await fr.query_selector(s)
+                    if el:
+                        return el, s, fr
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None, None, None
+
+
+async def click_first(page, selectors):
+    el, sel, ctx = await query_selector_any_in_page_or_frames(page, selectors)
+    if not el:
+        return False, None
+    try:
+        await el.scroll_into_view_if_needed()
+    except Exception:
+        pass
+    try:
+        await el.click()
+        return True, sel
+    except Exception:
+        try:
+            await el.dblclick()
+            return True, sel
+        except Exception:
+            try:
+                await el.click(force=True)
+                return True, sel
+            except Exception:
+                return False, sel
+
+
+async def fill_first(page, selectors, value: str):
+    el, sel, ctx = await query_selector_any_in_page_or_frames(page, selectors)
+    if not el:
+        return False, None
+    try:
+        await el.fill(value)
+        return True, sel
+    except Exception:
+        return False, sel
+
+
+def normalize_amount(s: str) -> Optional[str]:
+    try:
+        if s is None:
+            return None
+        v = str(s).strip().replace("\xa0", " ")
+        v = v.replace(",", "").replace(" ", "")
+        m = re.findall(r"[0-9]+(?:\.[0-9]{1,4})?", v)
+        if not m:
+            return None
+        num = m[0]
+        if "." in num:
+            parts = num.split(".")
+            decimals = (parts[1] + "00")[:2]
+            return f"{int(parts[0])}.{decimals}"
+        else:
+            return f"{int(num)}.00"
+    except Exception:
+        return None
+
+
+async def read_text(page, selector: str) -> Optional[str]:
+    try:
+        el = await page.query_selector(selector)
+        if el:
+            return await el.inner_text()
+    except Exception:
+        pass
+    for fr in page.frames:
+        try:
+            el = await fr.query_selector(selector)
+            if el:
+                return await el.inner_text()
+        except Exception:
+            continue
+    return None
 
 # S3 Configuration
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "fuel-invoices-receipt")
@@ -353,11 +465,15 @@ async def select_calns_in_popup(popup_page, navigation_steps) -> bool:
 @app.post("/login")
 async def login(credentials: LoginRequest):
     """Perform automated login with provided credentials"""
-    global browser_instance
     
     logger.info(f" Login automation started for user: {credentials.username}")
     logger.info(f"🌐 Target URL: {credentials.url}")
+    logger.info(f"Request context: s3_filename={credentials.s3_filename}, gross='{credentials.gross}', invoice_number='{credentials.invoice_number}'")
     
+    # init for cleanup
+    playwright = None
+    browser = None
+
     try:
         # Get headless setting from environment
         headless = os.getenv("HEADLESS", "true").lower() == "true"
@@ -389,48 +505,14 @@ async def login(credentials: LoginRequest):
         
         # Try to find and fill login form
         logger.info("🔍 Searching for login form elements...")
-        
-        # Common username field selectors
-        username_selectors = [
-            "input[name='username']",
-            "input[name='user']", 
-            "input[name='email']",
-            "input[name='login']",
-            "input[type='text']",
-            "#username",
-            "#user",
-            "#email"
-        ]
-        
-        # Common password field selectors
-        password_selectors = [
-            "input[name='password']",
-            "input[type='password']",
-            "#password"
-        ]
-        
-        # Submit button selectors
-        submit_selectors = [
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Login')",
-            "button:has-text('Sign in')",
-            "input[value*='Login']"
-        ]
-        
+
         # Fill username
         username_filled = False
         logger.info("👤 Attempting to fill username field...")
-        for selector in username_selectors:
-            try:
-                element = await page.query_selector(selector)
-                if element:
-                    await element.fill(credentials.username)
-                    username_filled = True
-                    logger.info(f"✅ Username filled using selector: {selector}")
-                    break
-            except:
-                continue
+        ok, sel = await fill_first(page, USERNAME_SELECTORS, credentials.username)
+        if ok:
+            username_filled = True
+            logger.info(f"✅ Username filled using selector: {sel}")
         
         if not username_filled:
             logger.warning("⚠️  Username field not found")
@@ -438,16 +520,10 @@ async def login(credentials: LoginRequest):
         # Fill password
         password_filled = False
         logger.info("🔐 Attempting to fill password field...")
-        for selector in password_selectors:
-            try:
-                element = await page.query_selector(selector)
-                if element:
-                    await element.fill(credentials.password)
-                    password_filled = True
-                    logger.info(f"✅ Password filled using selector: {selector}")
-                    break
-            except:
-                continue
+        ok, sel = await fill_first(page, PASSWORD_SELECTORS, credentials.password)
+        if ok:
+            password_filled = True
+            logger.info(f"✅ Password filled using selector: {sel}")
         
         if not password_filled:
             logger.warning("⚠️  Password field not found")
@@ -455,16 +531,10 @@ async def login(credentials: LoginRequest):
         # Submit form
         submit_clicked = False
         logger.info("🔄 Attempting to submit login form...")
-        for selector in submit_selectors:
-            try:
-                element = await page.query_selector(selector)
-                if element:
-                    await element.click()
-                    submit_clicked = True
-                    logger.info(f"✅ Form submitted using selector: {selector}")
-                    break
-            except:
-                continue
+        ok, sel = await click_first(page, SUBMIT_SELECTORS)
+        if ok:
+            submit_clicked = True
+            logger.info(f"✅ Form submitted using selector: {sel}")
         
         if not submit_clicked:
             logger.warning("⚠️  Submit button not found")
@@ -496,137 +566,64 @@ async def login(credentials: LoginRequest):
         logger.info("🧭 Starting navigation sequence...")
         navigation_success = False
         navigation_steps = []
+        save_clicked = False
+        check_clicked = False
+        post_clicked = False
         
         try:
             # Step 1: Hover over Fleet menu
-            fleet_element = await page.query_selector('td[id="HM_Menu1_top"]')
-            if not fleet_element:
-                # Try alternative selectors for Fleet
-                fleet_selectors = [
-                    'td:has-text("Fleet")',
-                    '[onmouseover*="HM_Menu1"]',
-                    '.top_menu_off:has-text("Fleet")'
-                ]
-                for selector in fleet_selectors:
-                    fleet_element = await page.query_selector(selector)
-                    if fleet_element:
-                        break
+            # Fleet menu hover
+            fleet_element, fleet_sel = await query_selector_any(page, FLEET_SELECTORS)
             
             if fleet_element:
                 await fleet_element.hover()
                 await page.wait_for_timeout(1000)  # Wait for dropdown to appear
-                navigation_steps.append("Fleet menu hovered")
+                navigation_steps.append(f"Fleet menu hovered via {fleet_sel}")
+                logger.info(f"Hovered Fleet via selector: {fleet_sel}")
                 
                 # Step 2: Hover over Card Services in the dropdown
-                card_services_selectors = [
-                    'text="Card Services"',
-                    'td:has-text("Card Services")',
-                    '[onmouseover]:has-text("Card Services")'
-                ]
-                
-                card_services_element = None
-                for selector in card_services_selectors:
-                    try:
-                        card_services_element = await page.query_selector(selector)
-                        if card_services_element:
-                            break
-                    except:
-                        continue
+                card_services_element, cs_sel = await query_selector_any(page, CARD_SERVICES_SELECTORS)
                 
                 if card_services_element:
                     await card_services_element.hover()
                     await page.wait_for_timeout(1000)  # Wait for submenu to appear
-                    navigation_steps.append("Card Services submenu hovered")
+                    navigation_steps.append(f"Card Services submenu hovered via {cs_sel}")
+                    logger.info(f"Hovered Card Services via selector: {cs_sel}")
                     
                     # Step 3: Click on Transactions
-                    transaction_selectors = [
-                        'text="Transactions"',
-                        'td:has-text("Transactions")',
-                        'a:has-text("Transactions")'
-                    ]
-                    
-                    transaction_element = None
-                    for selector in transaction_selectors:
-                        try:
-                            transaction_element = await page.query_selector(selector)
-                            if transaction_element:
-                                break
-                        except:
-                            continue
+                    transaction_element, tr_sel = await query_selector_any(page, TRANSACTION_SELECTORS)
                     
                     if transaction_element:
                         await transaction_element.click()
                         await page.wait_for_load_state("networkidle", timeout=10000)
-                        navigation_steps.append("Transactions clicked")
+                        navigation_steps.append(f"Transactions clicked via {tr_sel}")
+                        logger.info(f"Clicked Transactions via selector: {tr_sel}")
                         
                         # Step 4: Click Import button on transactions page
-                        import_button_selectors = [
-                            'input[name="button_import"]',
-                            'input[id="button_import"]',
-                            'input[value="Import"]',
-                            '.formbutton[value="Import"]'
-                        ]
-                        
-                        import_button_element = None
-                        for selector in import_button_selectors:
-                            try:
-                                import_button_element = await page.query_selector(selector)
-                                if import_button_element:
-                                    break
-                            except:
-                                continue
+                        import_button_element, import_sel, _ = await query_selector_any_in_page_or_frames(page, IMPORT_BUTTON_SELECTORS)
                         
                         if import_button_element:
                             await import_button_element.click()
                             await page.wait_for_load_state("networkidle", timeout=10000)
-                            navigation_steps.append("Import button clicked")
+                            navigation_steps.append(f"Import button clicked via {import_sel}")
+                            logger.info(f"Clicked Import via selector: {import_sel}")
                             
                             # Step 5: Fill input field with "CALNS"
-                            input_field_selectors = [
-                                'input[name="fm_int_interface_code"]',
-                                'input[id="fm_int_interface_code"]',
-                                '.forminput.border_input[name="fm_int_interface_code"]'
-                            ]
-                            
-                            input_field_element = None
-                            for selector in input_field_selectors:
-                                try:
-                                    input_field_element = await page.query_selector(selector)
-                                    if input_field_element:
-                                        break
-                                except:
-                                    continue
-                            
-                            if input_field_element:
-                                await input_field_element.fill("CALNS")
-                                navigation_steps.append("Input field filled with 'CALNS'")
+                            ok, sel = await fill_first(page, INTERFACE_CODE_INPUT_SELECTORS, "CALNS")
+                            if ok:
+                                navigation_steps.append(f"Interface code filled with 'CALNS' via {sel}")
+                                logger.info(f"Filled interface code with CALNS via selector: {sel}")
 
                                 # Wait 2 seconds as requested
                                 await page.wait_for_timeout(2000)
                                 navigation_steps.append("Waited 2 seconds after input")
                                 
                                 # Step 6: Click search button and handle popup window
-                                search_button_selectors = [
-                                    'i.catch_e_icon_search',
-                                    'i.catch-e-icon-lookingglass1',
-                                    'i[title="Find"]',
-                                    '.catch_e_icon_search',
-                                    '.catch-e-icon-lookingglass1',
-                                    'i[class*="catch_e_icon_search"]',
-                                    'i[class*="lookingglass"]'
-                                ]
-
-                                search_button_element = None
-                                for selector in search_button_selectors:
-                                    try:
-                                        search_button_element = await page.query_selector(selector)
-                                        if search_button_element:
-                                            break
-                                    except:
-                                        continue
+                                search_button_element, sb_sel, _ = await query_selector_any_in_page_or_frames(page, SEARCH_BUTTON_SELECTORS)
 
                                 if search_button_element:
-                                    navigation_steps.append("Search button found")
+                                    navigation_steps.append(f"Search button found via {sb_sel}")
+                                    logger.info(f"Found search button via selector: {sb_sel}")
 
                                     # Capture popup *window* before click
                                     popup_promise = page.wait_for_event("popup")
@@ -655,6 +652,7 @@ async def login(credentials: LoginRequest):
                                         # Try to detect if page has frames and find dropzone
                                         frames = page.frames
                                         navigation_steps.append(f"After popup close, page has {len(frames)} frames")
+                                        logger.debug(f"Frames after popup: {len(frames)}")
 
                                         dropzone_frame = None
                                         file_uploaded = False
@@ -669,32 +667,35 @@ async def login(credentials: LoginRequest):
 
                                         if dropzone_frame:
                                             navigation_steps.append(f"Found dropzone inside frame: {dropzone_frame.url}")
+                                            logger.info(f"Found dropzone in frame: {dropzone_frame.url}")
 
                                             # Wait for the dropzone inside that frame
                                             try:
-                                                await dropzone_frame.wait_for_selector('#file-attachment-dropzone', timeout=20000)
+                                                await dropzone_frame.wait_for_selector(DROPZONE_SELECTOR, timeout=20000)
                                                 
                                                 # Click browse and attach file if available
                                                 if upload_file_local_path and os.path.exists(upload_file_local_path):
                                                     try:
                                                         # Prefer direct file input if present
-                                                        file_input = await dropzone_frame.query_selector('input[type="file"]')
+                                                        file_input = await dropzone_frame.query_selector(FILE_INPUT_SELECTOR)
                                                         if file_input:
-                                                            await dropzone_frame.set_input_files('input[type="file"]', upload_file_local_path)
+                                                            await dropzone_frame.set_input_files(FILE_INPUT_SELECTOR, upload_file_local_path)
                                                             navigation_steps.append(f"File uploaded via set_input_files: {os.path.basename(upload_file_local_path)}")
                                                             file_uploaded = True
                                                             await page.wait_for_timeout(2000)
                                                             navigation_steps.append("Waited for file upload to process")
+                                                            logger.info("File uploaded via set_input_files (frame)")
                                                         else:
                                                             # Fall back to page-level file chooser while clicking inside frame
                                                             async with page.expect_file_chooser() as fc_info:
-                                                                await dropzone_frame.click('#file-attachment-dropzone a')
+                                                                await dropzone_frame.click(f"{DROPZONE_SELECTOR} a")
                                                             file_chooser = await fc_info.value
                                                             await file_chooser.set_files(upload_file_local_path)
                                                             navigation_steps.append(f"File uploaded via file chooser: {os.path.basename(upload_file_local_path)}")
                                                             file_uploaded = True
                                                             await page.wait_for_timeout(2000)
                                                             navigation_steps.append("Waited for file upload to process")
+                                                            logger.info("File uploaded via file chooser (frame)")
                                                     except Exception as upload_error:
                                                         navigation_steps.append(f"File upload error: {str(upload_error)}")
                                                     finally:
@@ -707,7 +708,7 @@ async def login(credentials: LoginRequest):
                                                 else:
                                                     # No file provided; try opening browse to indicate reachability
                                                     try:
-                                                        await dropzone_frame.click('#file-attachment-dropzone a')
+                                                        await dropzone_frame.click(f"{DROPZONE_SELECTOR} a")
                                                         navigation_steps.append("Clicked 'browse' link inside dropzone frame (no file upload)")
                                                     except Exception:
                                                         navigation_steps.append("Dropzone link not clickable without file")
@@ -718,17 +719,18 @@ async def login(credentials: LoginRequest):
                                         else:
                                             # Fallback — maybe dropzone is in main DOM, but just delayed
                                             try:
-                                                await page.wait_for_selector('#file-attachment-dropzone', timeout=20000)
+                                                await page.wait_for_selector(DROPZONE_SELECTOR, timeout=20000)
                                                 
                                                 # Click browse and attach file if available (main page)
                                                 if upload_file_local_path and os.path.exists(upload_file_local_path):
                                                     try:
-                                                        file_input = await page.query_selector('input[type="file"]')
+                                                        file_input = await page.query_selector(FILE_INPUT_SELECTOR)
                                                         if not file_input:
                                                             navigation_steps.append("No file input found on main page")
                                                         else:
-                                                            await page.set_input_files('input[type="file"]', upload_file_local_path)
+                                                            await page.set_input_files(FILE_INPUT_SELECTOR, upload_file_local_path)
                                                             navigation_steps.append(f"File uploaded via set_input_files on main page: {os.path.basename(upload_file_local_path)}")
+                                                            logger.info("File uploaded via set_input_files (main page)")
                                                             file_uploaded = True
                                                             # Wait 2 sec for Catch-E to parse file
                                                             await page.wait_for_timeout(2000)
@@ -743,7 +745,7 @@ async def login(credentials: LoginRequest):
                                                         except:
                                                             pass
                                                 else:
-                                                    await page.click('#file-attachment-dropzone a')
+                                                    await page.click(f"{DROPZONE_SELECTOR} a")
                                                     navigation_steps.append("Clicked 'browse' link successfully on main page (no file upload)")
                                                     
                                             except Exception as browse_error:
@@ -754,183 +756,170 @@ async def login(credentials: LoginRequest):
                                             try:
                                                 await page.wait_for_timeout(5000)
                                                 navigation_steps.append("Waited 5 seconds before clicking Upload")
+                                                logger.debug("Waiting before Upload click complete")
 
-                                                upload_selectors = [
-                                                    '#button_upload',
-                                                    'input#button_upload',
-                                                    'input[name="button_upload"]',
-                                                    'input.formbutton[value="Upload"]',
-                                                    'input[value="Upload"]'
-                                                ]
-
-                                                clicked = False
-                                                # Try main page first
-                                                for sel in upload_selectors:
-                                                    try:
-                                                        loc = await page.query_selector(sel)
-                                                        if loc:
-                                                            await loc.scroll_into_view_if_needed()
-                                                            await loc.click()
-                                                            navigation_steps.append(f"Clicked Upload button using selector on main page: {sel}")
-                                                            clicked = True
-                                                            break
-                                                    except Exception:
-                                                        continue
-
-                                                # If not found on main page, try within frames
-                                                if not clicked:
-                                                    for fr in page.frames:
-                                                        try:
-                                                            for sel in upload_selectors:
-                                                                try:
-                                                                    loc = await fr.query_selector(sel)
-                                                                    if loc:
-                                                                        await loc.scroll_into_view_if_needed()
-                                                                        await loc.click()
-                                                                        navigation_steps.append(f"Clicked Upload button inside frame using selector: {sel}")
-                                                                        clicked = True
-                                                                        break
-                                                                except Exception:
-                                                                    continue
-                                                            if clicked:
-                                                                break
-                                                        except Exception:
-                                                            continue
-
-                                                if not clicked:
+                                                ok, sel = await click_first(page, UPLOAD_BUTTON_SELECTORS)
+                                                if not ok:
                                                     navigation_steps.append("Upload button not found after file selection")
+                                                    logger.error("Upload button not found")
                                                 else:
                                                     # After successful click, wait briefly for any DOM updates
                                                     await page.wait_for_timeout(2000)
-                                                    navigation_steps.append("Post-upload wait completed")
+                                                    navigation_steps.append(f"Clicked Upload via {sel}; post-upload wait completed")
+                                                    logger.info(f"Clicked Upload via selector: {sel}")
 
-                                                    # Attempt to fill the invoice number field
-                                                    invoice_selectors = [
-                                                        'input#invoice_no',
-                                                        'input[name="invoice_no"]',
-                                                        'input.forminput#invoice_no'
-                                                    ]
-                                                    invoice_filled = False
+                                                    # Validation 2: record already exists -> invoice field not present
+                                                    invoice_el, invoice_sel, _ = await query_selector_any_in_page_or_frames(page, INVOICE_INPUT_SELECTORS)
+                                                    if not invoice_el:
+                                                        navigation_steps.append("Invoice input not present; record likely exists")
+                                                        logger.error("Validation failed: record_exists (invoice field missing)")
+                                                        # Early return error
+                                                        return {
+                                                            "success": False,
+                                                            "status": "error",
+                                                            "error": {
+                                                                "key": "record_exists",
+                                                                "message": "Record already exists; invoice number input not shown"
+                                                            },
+                                                            "data": {
+                                                                "navigation_steps": navigation_steps
+                                                            }
+                                                        }
+
+                                                    # Fill the invoice number if provided
                                                     if credentials.invoice_number:
-                                                        for sel in invoice_selectors:
-                                                            try:
-                                                                # Wait for selector to appear (short timeout per selector)
-                                                                elem = await page.query_selector(sel)
-                                                                if not elem:
-                                                                    continue
-                                                                await elem.fill(credentials.invoice_number)
-                                                                navigation_steps.append(f"Filled invoice number using selector: {sel}")
-                                                                invoice_filled = True
-                                                                break
-                                                            except Exception:
-                                                                continue
-                                                        if not invoice_filled:
-                                                            navigation_steps.append("Invoice number field not found / not filled")
+                                                        try:
+                                                            await invoice_el.fill(credentials.invoice_number)
+                                                            navigation_steps.append(f"Filled invoice number via {invoice_sel}")
+                                                            logger.info(f"Filled invoice field via selector: {invoice_sel}")
+                                                        except Exception as inv_err:
+                                                            navigation_steps.append("Failed to fill invoice number even though field present")
+                                                            logger.error(f"Failed to fill invoice number: {inv_err}")
                                                     else:
                                                         navigation_steps.append("No invoice_number provided in request; skipping fill")
+                                                        logger.debug("No invoice number provided in payload")
 
                                                     # Compare displayed total_gross with provided gross; if equal, click Save
-                                                    def _normalize_amount(s: str) -> Optional[str]:
-                                                        try:
-                                                            if s is None:
-                                                                return None
-                                                            # strip whitespace and non-breaking spaces
-                                                            v = str(s).strip().replace("\xa0", " ")
-                                                            # remove thousands separators and spaces
-                                                            v = v.replace(",", "").replace(" ", "")
-                                                            # keep only digits and decimal point
-                                                            m = re.findall(r"[0-9]+(?:\.[0-9]{1,4})?", v)
-                                                            if not m:
-                                                                return None
-                                                            # format to two decimals where possible
-                                                            num = m[0]
-                                                            if "." in num:
-                                                                parts = num.split(".")
-                                                                decimals = (parts[1] + "00")[:2]
-                                                                return f"{int(parts[0])}.{decimals}"
-                                                            else:
-                                                                return f"{int(num)}.00"
-                                                        except Exception:
-                                                            return None
-
-                                                    # Find total_gross text either on main page or in frames
+                                                    # Find total_gross text; wait briefly for it to render
                                                     displayed_gross_text = None
-                                                    try:
-                                                        gross_el = await page.query_selector('#total_gross')
-                                                        if gross_el:
-                                                            displayed_gross_text = (await gross_el.inner_text())
-                                                    except Exception:
-                                                        pass
-                                                    if not displayed_gross_text:
-                                                        for fr in page.frames:
-                                                            try:
-                                                                gross_el = await fr.query_selector('#total_gross')
-                                                                if gross_el:
-                                                                    displayed_gross_text = (await gross_el.inner_text())
-                                                                    break
-                                                            except Exception:
-                                                                continue
+                                                    for _ in range(8):  # up to ~8s
+                                                        displayed_gross_text = await read_text(page, TOTAL_GROSS_SELECTOR)
+                                                        if displayed_gross_text and displayed_gross_text.strip():
+                                                            break
+                                                        await page.wait_for_timeout(1000)
 
-                                                    provided_gross_norm = _normalize_amount(credentials.gross)
-                                                    displayed_gross_norm = _normalize_amount(displayed_gross_text)
+                                                    provided_gross_norm = normalize_amount(credentials.gross)
+                                                    displayed_gross_norm = normalize_amount(displayed_gross_text)
+                                                    logger.info(f"Gross check: raw_displayed='{displayed_gross_text}', displayed_norm='{displayed_gross_norm}', provided_norm='{provided_gross_norm}'")
 
-                                                    if displayed_gross_norm and provided_gross_norm:
-                                                        if displayed_gross_norm == provided_gross_norm:
-                                                            navigation_steps.append(f"total_gross matches provided gross ({displayed_gross_norm})")
+                                                    # Validation 1: gross must match
+                                                    if not displayed_gross_norm:
+                                                        logger.error("Validation failed: gross_not_found")
+                                                        return {
+                                                            "success": False,
+                                                            "status": "error",
+                                                            "error": {
+                                                                "key": "gross_not_found",
+                                                                "message": "Could not read total gross from the page"
+                                                            },
+                                                            "data": {
+                                                                "navigation_steps": navigation_steps,
+                                                                "raw_displayed_gross": displayed_gross_text
+                                                            }
+                                                        }
+                                                    if not provided_gross_norm:
+                                                        logger.error("Validation failed: gross_invalid (payload)")
+                                                        return {
+                                                            "success": False,
+                                                            "status": "error",
+                                                            "error": {
+                                                                "key": "gross_invalid",
+                                                                "message": "Provided gross is invalid or unparseable"
+                                                            },
+                                                            "data": {
+                                                                "navigation_steps": navigation_steps,
+                                                                "provided_gross": credentials.gross
+                                                            }
+                                                        }
 
-                                                            # Attempt to click Save button
-                                                            save_selectors = [
-                                                                '#button_save_preview',
-                                                                'input#button_save_preview',
-                                                                'input[name="button_save_preview"]',
-                                                                'input.formbutton#button_save_preview',
-                                                                'input.formbutton[value="Save"]'
-                                                            ]
-                                                            save_clicked = False
+                                                    if displayed_gross_norm != provided_gross_norm:
+                                                        logger.error(f"Validation failed: gross_mismatch (displayed={displayed_gross_norm}, provided={provided_gross_norm})")
+                                                        return {
+                                                            "success": False,
+                                                            "status": "error",
+                                                            "error": {
+                                                                "key": "gross_mismatch",
+                                                                "message": f"Gross mismatch: displayed={displayed_gross_norm}, provided={provided_gross_norm}"
+                                                            },
+                                                            "data": {
+                                                                "navigation_steps": navigation_steps
+                                                            }
+                                                        }
 
-                                                            # Try main page first
-                                                            # for sel in save_selectors:
-                                                            #     try:
-                                                            #         loc = await page.query_selector(sel)
-                                                            #         if loc:
-                                                            #             await loc.scroll_into_view_if_needed()
-                                                            #             await loc.click()
-                                                            #             navigation_steps.append(f"Clicked Save button using selector: {sel}")
-                                                            #             save_clicked = True
-                                                            #             break
-                                                            #     except Exception:
-                                                            #         continue
+                                                    navigation_steps.append(f"total_gross matches provided gross ({displayed_gross_norm})")
+                                                    logger.info("Validation passed: gross matched")
 
-                                                            # # If not on main page, search in frames
-                                                            # if not save_clicked:
-                                                            #     for fr in page.frames:
-                                                            #         try:
-                                                            #             for sel in save_selectors:
-                                                            #                 try:
-                                                            #                     loc = await fr.query_selector(sel)
-                                                            #                     if loc:
-                                                            #                         await loc.scroll_into_view_if_needed()
-                                                            #                         await loc.click()
-                                                            #                         navigation_steps.append(f"Clicked Save button inside frame using selector: {sel}")
-                                                            #                         save_clicked = True
-                                                            #                         break
-                                                            #                 except Exception:
-                                                            #                     continue
-                                                            #             if save_clicked:
-                                                            #                 break
-                                                            #         except Exception:
-                                                            #             continue
-
-                                                            if not save_clicked:
-                                                                navigation_steps.append("Save button not found after gross match")
-                                                            else:
-                                                                # Give time for save action to process
-                                                                await page.wait_for_timeout(3000)
-                                                                navigation_steps.append("Post-save wait completed")
-                                                        else:
-                                                            navigation_steps.append(f"Gross mismatch; displayed={displayed_gross_norm}, provided={provided_gross_norm}")
+                                                    # Passed validations — attempt to click Save
+                                                    ok, save_sel = await click_first(page, SAVE_BUTTON_SELECTORS)
+                                                    if not ok:
+                                                        navigation_steps.append("Save button not found after gross match")
+                                                        logger.error("Save button not found after gross match")
+                                                        save_clicked = False
                                                     else:
-                                                        navigation_steps.append("Could not normalize displayed/provided gross for comparison")
+                                                        save_clicked = True
+                                                        # Allow some time for server-side save to process
+                                                        try:
+                                                            await page.wait_for_load_state("networkidle", timeout=8000)
+                                                        except Exception:
+                                                            await page.wait_for_timeout(3000)
+                                                        navigation_steps.append(f"Clicked Save via {save_sel}; post-save wait completed")
+                                                        logger.info(f"Clicked Save via selector: {save_sel}")
+
+                                                        # After Save, wait 2 seconds then click Check
+                                                        await page.wait_for_timeout(2000)
+                                                        navigation_steps.append("Waited 2 seconds after Save")
+                                                        ok, check_sel = await click_first(page, CHECK_BUTTON_SELECTORS)
+                                                        if ok:
+                                                            check_clicked = True
+                                                            navigation_steps.append(f"Clicked Check via {check_sel}")
+                                                            logger.info(f"Clicked Check via selector: {check_sel}")
+                                                            # Small stabilization wait
+                                                            try:
+                                                                await page.wait_for_load_state("networkidle", timeout=6000)
+                                                            except Exception:
+                                                                await page.wait_for_timeout(1500)
+                                                            # Inspect error area to decide whether to post
+                                                            error_text = await read_text(page, '#error_msg')
+                                                            norm_err = (error_text or '').replace('\xa0', ' ').strip()
+                                                            if not norm_err:
+                                                                # No error shown; attempt to click Post
+                                                                ok, post_sel = await click_first(page, POST_BUTTON_SELECTORS)
+                                                                if ok:
+                                                                    post_clicked = True
+                                                                    navigation_steps.append(f"Clicked Post via {post_sel}")
+                                                                    logger.info(f"Clicked Post via selector: {post_sel}")
+                                                                    try:
+                                                                        await page.wait_for_load_state("networkidle", timeout=8000)
+                                                                    except Exception:
+                                                                        await page.wait_for_timeout(2000)
+                                                                else:
+                                                                    navigation_steps.append("Post button not found or still disabled after Check")
+                                                                    logger.error("Post button not found or disabled after Check")
+                                                            else:
+                                                                # Found error text after Check — return error
+                                                                logger.error(f"Check failed with message: {norm_err}")
+                                                                return {
+                                                                    "success": False,
+                                                                    "status": "error",
+                                                                    "error": {
+                                                                        "key": "check_failed",
+                                                                        "message": norm_err
+                                                                    },
+                                                                    "data": {"navigation_steps": navigation_steps}
+                                                                }
+                                                        else:
+                                                            navigation_steps.append("Check button not found after Save")
+                                                            logger.error("Check button not found after Save")
                                             except Exception as upload_click_error:
                                                 navigation_steps.append(f"Failed to click Upload button: {upload_click_error}")
 
@@ -976,6 +965,9 @@ async def login(credentials: LoginRequest):
                 "password_filled": password_filled,
                 "submit_clicked": submit_clicked,
                 "navigation_success": navigation_success,
+                "save_clicked": save_clicked,
+                "check_clicked": check_clicked,
+                "post_clicked": post_clicked,
                 "navigation_steps": navigation_steps,
                 "final_url": final_url,
                 "page_title": page_title
@@ -985,26 +977,20 @@ async def login(credentials: LoginRequest):
     except Exception as e:
         logger.error(f"❌ Automation failed: {str(e)}")
         logger.exception("Full error traceback:")
-        
-        # Clean up on error
         try:
-            if browser_instance:
-                await browser_instance.close()
+            if browser:
+                await browser.close()
                 logger.info("🔄 Browser cleaned up after error")
-        except:
-            logger.warning("⚠️  Failed to cleanup browser")
+            if playwright:
+                await playwright.stop()
+        except Exception:
+            logger.warning("⚠️  Failed to cleanup browser/playwright")
         
         return {
             "success": False,
             "message": f"Login failed: {str(e)}",
             "error": str(e)
         }
-
-
-@app.get("/health")
-async def health():
-    """Health check"""
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     # Get configuration from environment or use defaults
