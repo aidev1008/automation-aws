@@ -552,15 +552,25 @@ async def login(credentials: LoginRequest):
         page_title = await page.title()
         logger.info(f"📄 Current page: {page_title} - {final_url}")
         
-        # If provided, pre-resolve and download S3 file for upload later
+        # Resolve and download S3 file (required) — error if not found
         upload_file_local_path: Optional[str] = None
-        if credentials.s3_filename:
-            logger.info(f"[S3] Resolving provided filename: {credentials.s3_filename}")
-            upload_file_local_path = prepare_local_file_from_s3(credentials.s3_filename)
-            if upload_file_local_path:
-                logger.info(f"[S3] File ready for upload at: {upload_file_local_path}")
-            else:
-                logger.warning("[S3] Could not prepare file for upload; proceeding without upload")
+        logger.info(f"[S3] Resolving provided filename: {credentials.s3_filename}")
+        upload_file_local_path = prepare_local_file_from_s3(credentials.s3_filename)
+        if upload_file_local_path:
+            logger.info(f"[S3] File ready for upload at: {upload_file_local_path}")
+        else:
+            logger.error(f"[S3] File not found in bucket or could not be downloaded: {credentials.s3_filename}")
+            return {
+                "success": False,
+                "status": "error",
+                "error": {
+                    "key": "s3_not_found",
+                    "message": f"File not found in S3 or no match: {credentials.s3_filename}"
+                },
+                "data": {
+                    "provided_filename": credentials.s3_filename
+                }
+            }
 
         # Navigation after successful login
         logger.info("🧭 Starting navigation sequence...")
@@ -959,6 +969,7 @@ async def login(credentials: LoginRequest):
         
         return {
             "success": True,
+            "status": "completed",
             "message": "Login and navigation completed",
             "data": {
                 "username_filled": username_filled,
@@ -988,6 +999,7 @@ async def login(credentials: LoginRequest):
         
         return {
             "success": False,
+            "status": "error",
             "message": f"Login failed: {str(e)}",
             "error": str(e)
         }
