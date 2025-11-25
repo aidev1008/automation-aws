@@ -122,3 +122,13 @@ POST_BUTTON_SELECTORS = [
     'input#button_post',
     'input[name="button_post"]',
 ]
+
+# Abort action (pre-check abort button)
+ABORT_BUTTON_SELECTORS = [
+    '#button_pre_abort',
+    'input#button_pre_abort',
+    'input[name="button_pre_abort"]',
+    'input.formbutton#button_pre_abort',
+    'input[name="button_pre_abort"][value="Abort"]',
+    'input[type="button"][name="button_pre_abort"]',
+]

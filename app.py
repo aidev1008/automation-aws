@@ -36,6 +36,7 @@ from web_selectors import (
     SAVE_BUTTON_SELECTORS,
     CHECK_BUTTON_SELECTORS,
     POST_BUTTON_SELECTORS,
+    ABORT_BUTTON_SELECTORS,
 )
 
 load_dotenv()
@@ -913,8 +914,27 @@ async def login(credentials: LoginRequest):
                                                                     except Exception:
                                                                         await page.wait_for_timeout(2000)
                                                                 else:
-                                                                    navigation_steps.append("Post button not found or still disabled after Check")
-                                                                    logger.error("Post button not found or disabled after Check")
+                                                                    # Post button is disabled, click Abort and return error
+                                                                    navigation_steps.append("Post button is disabled after Check")
+                                                                    logger.error("Post button is disabled after Check, clicking Abort")
+                                                                    abort_ok, abort_sel = await click_first(page, ABORT_BUTTON_SELECTORS)
+                                                                    if abort_ok:
+                                                                        navigation_steps.append(f"Clicked Abort via {abort_sel}")
+                                                                        logger.info(f"Clicked Abort via selector: {abort_sel}")
+                                                                    else:
+                                                                        navigation_steps.append("Abort button not found")
+                                                                        logger.error("Abort button not found")
+                                                                    return {
+                                                                        "success": False,
+                                                                        "status": "error",
+                                                                        "error": {
+                                                                            "key": "post_button_disabled",
+                                                                            "message": "Post button is disabled after Check validation"
+                                                                        },
+                                                                        "data": {
+                                                                            "navigation_steps": navigation_steps
+                                                                        }
+                                                                    }
                                                             else:
                                                                 # Found error text after Check — return error
                                                                 logger.error(f"Check failed with message: {norm_err}")
@@ -963,8 +983,8 @@ async def login(credentials: LoginRequest):
         
         # Close browser
         logger.info("🔄 Closing browser...")
-        # await browser.close()
-        # await playwright.stop()
+        await browser.close()
+        await playwright.stop()
         logger.info("✅ Automation completed successfully!")
         
         return {
