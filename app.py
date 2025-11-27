@@ -36,6 +36,7 @@ from web_selectors import (
     SAVE_BUTTON_SELECTORS,
     CHECK_BUTTON_SELECTORS,
     POST_BUTTON_SELECTORS,
+    POST_BUTTON_ANY_SELECTORS,
     ABORT_BUTTON_SELECTORS,
 )
 
@@ -484,17 +485,12 @@ async def login(credentials: LoginRequest):
         logger.info("🔧 Initializing Playwright browser...")
         playwright = await async_playwright().start()
         browser = await playwright.firefox.launch(headless=headless)
-        # Configurable viewport to control window size
-        try:
-            vp_width = int(os.getenv("BROWSER_WIDTH", "720"))
-            vp_height = int(os.getenv("BROWSER_HEIGHT", "780"))
-        except Exception:
-            vp_width, vp_height = 720, 780
+        # Use fullscreen viewport
         context = await browser.new_context(
-            viewport={"width": vp_width, "height": vp_height},
-            screen={"width": vp_width, "height": vp_height}
+            viewport={"width": 1920, "height": 1080},
+            screen={"width": 1920, "height": 1080}
         )
-        logger.info(f"Viewport set to {vp_width}x{vp_height}")
+        logger.info("Viewport set to fullscreen (1920x1080)")
         page = await context.new_page()
         logger.info("✅ Browser initialized successfully")
         
@@ -894,7 +890,10 @@ async def login(credentials: LoginRequest):
                                                             check_clicked = True
                                                             navigation_steps.append(f"Clicked Check via {check_sel}")
                                                             logger.info(f"Clicked Check via selector: {check_sel}")
-                                                            # Small stabilization wait
+                                                            # Wait 3 seconds after Check
+                                                            await page.wait_for_timeout(3000)
+                                                            navigation_steps.append("Waited 3 seconds after Check")
+                                                            # Additional stabilization wait
                                                             try:
                                                                 await page.wait_for_load_state("networkidle", timeout=6000)
                                                             except Exception:
@@ -914,27 +913,43 @@ async def login(credentials: LoginRequest):
                                                                     except Exception:
                                                                         await page.wait_for_timeout(2000)
                                                                 else:
-                                                                    # Post button is disabled, click Abort and return error
-                                                                    navigation_steps.append("Post button is disabled after Check")
-                                                                    logger.error("Post button is disabled after Check, clicking Abort")
-                                                                    abort_ok, abort_sel = await click_first(page, ABORT_BUTTON_SELECTORS)
-                                                                    if abort_ok:
-                                                                        navigation_steps.append(f"Clicked Abort via {abort_sel}")
-                                                                        logger.info(f"Clicked Abort via selector: {abort_sel}")
+                                                                    # Check if Post button exists but is disabled
+                                                                    post_btn_el, post_btn_sel, _ = await query_selector_any_in_page_or_frames(page, POST_BUTTON_ANY_SELECTORS)
+                                                                    if post_btn_el:
+                                                                        try:
+                                                                            is_disabled = await post_btn_el.is_disabled()
+                                                                        except:
+                                                                            # Fallback: check disabled attribute
+                                                                            is_disabled = await post_btn_el.get_attribute('disabled') is not None
+                                                                        
+                                                                        if is_disabled:
+                                                                            # Post button exists and is disabled, click Abort and return error
+                                                                            navigation_steps.append(f"Post button found but is disabled (via {post_btn_sel})")
+                                                                            logger.error("Post button is disabled after Check, clicking Abort")
+                                                                            abort_ok, abort_sel = await click_first(page, ABORT_BUTTON_SELECTORS)
+                                                                            if abort_ok:
+                                                                                navigation_steps.append(f"Clicked Abort via {abort_sel}")
+                                                                                logger.info(f"Clicked Abort via selector: {abort_sel}")
+                                                                            else:
+                                                                                navigation_steps.append("Abort button not found")
+                                                                                logger.error("Abort button not found")
+                                                                            return {
+                                                                                "success": False,
+                                                                                "status": "error",
+                                                                                "error": {
+                                                                                    "key": "post_button_disabled",
+                                                                                    "message": "Post button is disabled after Check validation"
+                                                                                },
+                                                                                "data": {
+                                                                                    "navigation_steps": navigation_steps
+                                                                                }
+                                                                            }
+                                                                        else:
+                                                                            navigation_steps.append(f"Post button found but could not be clicked (via {post_btn_sel})")
+                                                                            logger.error("Post button exists but click failed")
                                                                     else:
-                                                                        navigation_steps.append("Abort button not found")
-                                                                        logger.error("Abort button not found")
-                                                                    return {
-                                                                        "success": False,
-                                                                        "status": "error",
-                                                                        "error": {
-                                                                            "key": "post_button_disabled",
-                                                                            "message": "Post button is disabled after Check validation"
-                                                                        },
-                                                                        "data": {
-                                                                            "navigation_steps": navigation_steps
-                                                                        }
-                                                                    }
+                                                                        navigation_steps.append("Post button not found after Check")
+                                                                        logger.error("Post button not found on page")
                                                             else:
                                                                 # Found error text after Check — return error
                                                                 logger.error(f"Check failed with message: {norm_err}")

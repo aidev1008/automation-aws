@@ -123,6 +123,14 @@ POST_BUTTON_SELECTORS = [
     'input[name="button_post"]',
 ]
 
+# Post button selectors to check if it exists (including disabled)
+POST_BUTTON_ANY_SELECTORS = [
+    '#button_post',
+    'input#button_post',
+    'input[name="button_post"]',
+    'input[value=" Post "]',
+]
+
 # Abort action (pre-check abort button)
 ABORT_BUTTON_SELECTORS = [
     '#button_pre_abort',
